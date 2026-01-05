@@ -355,8 +355,7 @@ function App() {
     <div className="min-h-screen bg-slate-100 pb-16">
       <header className="bg-slate-900 py-10 text-white">
         <div className="mx-auto max-w-4xl px-4">
-          <h1 className="text-3xl font-bold">Herramientas NSL-KDD</h1>
-          <p className="mt-2 text-sm text-slate-300">Selecciona una vista para trabajar con los distintos endpoints.</p>
+          <h1 className="text-3xl font-bold">HSimulacion - NSL-KDD</h1>
         </div>
       </header>
 
