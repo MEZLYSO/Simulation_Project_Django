@@ -34,6 +34,33 @@ La aplicación Django expone endpoints para inferencia sobre el dataset NSL-KDD.
 		]
 	}
 	```
+- **Ejemplo `curl`:**
+	```bash
+	curl -X POST http://localhost:8000/api/preview-dataset/ \
+		-F "file=@KDDTrain+.arff"
+	```
+
+### División y preparación de dataset ARFF
+
+- **Ruta:** `/api/split-dataset/`
+- **Método:** `POST`
+- **Headers:** `Content-Type: multipart/form-data`
+- **Body:**
+	- Campo de archivo `file` con el dataset `.arff`.
+	- Campo opcional `options` con un JSON que define las transformaciones (por ejemplo `{"target_column": "class", "missing_strategy": "mean", "categorical_strategy": "onehot", "scale_numeric": "robust", "train_size": 0.6, "val_size": 0.2, "test_size": 0.2}`).
+- **Funciones disponibles:**
+	- `missing_strategy`: `none`, `drop_rows`, `drop_columns`, `mean`, `median`.
+	- `categorical_strategy`: `none`, `factorize`, `ordinal`, `onehot`, `get_dummies`.
+	- `scale_numeric`: `none`, `robust`.
+	- `stratify`: `true` (usa columna objetivo) o nombre de columna.
+- **Respuesta:** Archivo `.zip` con tres ficheros ARFF (`*_train.arff`, `*_val.arff`, `*_test.arff`).
+- **Ejemplo `curl`:**
+	```bash
+	curl -X POST http://localhost:8000/api/split-dataset/ \
+		-F "file=@KDDTrain+.arff" \
+		-F 'options={"missing_strategy":"mean","categorical_strategy":"onehot"}' \
+		-o splits.zip
+	```
 
 ### Predicción de tráfico de red
 

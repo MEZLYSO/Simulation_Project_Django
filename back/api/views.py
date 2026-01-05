@@ -1,12 +1,14 @@
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from pathlib import Path
-from io import StringIO
+from io import StringIO, BytesIO
+import zipfile
+import math
 import arff
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, OrdinalEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.pipeline import Pipeline
@@ -173,6 +175,255 @@ def _ensure_nsl_kdd_model(force_retrain=False):
 
 
 # ==================== Endpoints ====================
+
+
+def _validate_split_sizes(train_size, val_size, test_size):
+    total = train_size + val_size + test_size
+    if not math.isclose(total, 1.0, abs_tol=1e-6):
+        raise ValueError("Las proporciones de train/val/test deben sumar 1.0")
+
+
+def _split_dataset(df, train_size, val_size, test_size, stratify_col=None, random_state=42):
+    stratify_series = df[stratify_col] if stratify_col and stratify_col in df.columns else None
+
+    temp_size = val_size + test_size
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=temp_size,
+        shuffle=True,
+        random_state=random_state,
+        stratify=stratify_series
+    )
+
+    if temp_size == 0:
+        return train_df, pd.DataFrame(columns=df.columns), pd.DataFrame(columns=df.columns)
+
+    temp_stratify = None
+    if stratify_col and stratify_col in temp_df.columns:
+        temp_stratify = temp_df[stratify_col]
+
+    relative_test_size = test_size / temp_size if temp_size else 0
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=relative_test_size,
+        shuffle=True,
+        random_state=random_state,
+        stratify=temp_stratify
+    )
+
+    return train_df, val_df, test_df
+
+
+def _apply_missing_strategy(features_df, target_series, strategy):
+    if strategy == "drop_rows":
+        combined = features_df
+        if target_series is not None:
+            combined = pd.concat([features_df, target_series], axis=1)
+        mask = combined.dropna().index
+        features_df = features_df.loc[mask]
+        if target_series is not None:
+            target_series = target_series.loc[mask]
+    elif strategy == "drop_columns":
+        cols_with_na = [col for col in features_df.columns if features_df[col].isna().any()]
+        features_df = features_df.drop(columns=cols_with_na)
+    elif strategy in {"mean", "median"}:
+        num_cols = features_df.select_dtypes(include=[np.number]).columns
+        if not num_cols.empty:
+            if strategy == "mean":
+                fill_values = features_df[num_cols].mean()
+            else:
+                fill_values = features_df[num_cols].median()
+            features_df[num_cols] = features_df[num_cols].fillna(fill_values)
+    return features_df, target_series
+
+
+def _apply_categorical_strategy(features_df, strategy):
+    if strategy in {None, "", "none"}:
+        return features_df
+
+    cat_cols = features_df.select_dtypes(exclude=[np.number]).columns
+    if not len(cat_cols):
+        return features_df
+
+    if strategy == "factorize":
+        for col in cat_cols:
+            codes, _ = pd.factorize(features_df[col])
+            codes = pd.Series(codes, index=features_df.index)
+            codes = codes.replace(-1, np.nan)
+            features_df[col] = codes.astype(float)
+    elif strategy == "ordinal":
+        encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+        original = features_df[cat_cols]
+        na_mask = original.isna()
+        encoded = encoder.fit_transform(original.fillna("__missing__"))
+        encoded_df = pd.DataFrame(encoded, index=features_df.index, columns=cat_cols)
+        encoded_df = encoded_df.replace(-1, np.nan)
+        for col in cat_cols:
+            encoded_df.loc[na_mask[col], col] = np.nan
+        for col in cat_cols:
+            features_df[col] = encoded_df[col]
+    elif strategy in {"onehot", "get_dummies"}:
+        features_df = pd.get_dummies(features_df, columns=cat_cols, dummy_na=False)
+    else:
+        raise ValueError(f"Estrategia de categorización desconocida: {strategy}")
+    return features_df
+
+
+def _scale_numeric(features_df, strategy):
+    if strategy not in {"robust"}:
+        return features_df
+    num_cols = features_df.select_dtypes(include=[np.number]).columns
+    if not len(num_cols):
+        return features_df
+    scaler = RobustScaler()
+    features_df[num_cols] = scaler.fit_transform(features_df[num_cols])
+    return features_df
+
+
+def _ensure_arff_ready(df):
+    df = df.copy()
+    df.replace({'?': np.nan}, inplace=True)
+    return df.replace({np.nan: None})
+
+
+def _dataframe_to_arff(df, relation_name):
+    clean_df = _ensure_arff_ready(df)
+    attributes = []
+    for column in clean_df.columns:
+        series = clean_df[column]
+        if pd.api.types.is_numeric_dtype(series):
+            attr_type = "REAL"
+        else:
+            unique_vals = sorted({str(val) for val in series if val is not None})
+            attr_type = unique_vals if unique_vals else ["__empty__"]
+        attributes.append((column, attr_type))
+
+    data_rows = []
+    for _, row in clean_df.iterrows():
+        converted_row = []
+        for value in row:
+            if isinstance(value, (np.generic,)):
+                converted_row.append(value.item())
+            else:
+                converted_row.append(value)
+        data_rows.append(converted_row)
+
+    arff_obj = {
+        "relation": relation_name,
+        "attributes": attributes,
+        "data": data_rows,
+    }
+    return arff.dumps(arff_obj)
+
+
+def _preprocess_dataframe(df, options):
+    df = df.copy()
+    df.replace({'?': np.nan}, inplace=True)
+
+    target_column = options.get("target_column", "class")
+    if target_column not in df.columns:
+        target_column = None
+
+    target_series = df[target_column] if target_column else None
+    features_df = df.drop(columns=[target_column]) if target_column else df
+
+    missing_strategy = options.get("missing_strategy", "none")
+    features_df, target_series = _apply_missing_strategy(features_df, target_series, missing_strategy)
+
+    categorical_strategy = options.get("categorical_strategy", "none")
+    features_df = _apply_categorical_strategy(features_df, categorical_strategy)
+
+    scaling_strategy = options.get("scale_numeric", "none")
+    features_df = _scale_numeric(features_df, scaling_strategy)
+
+    if target_column:
+        processed_df = pd.concat([features_df, target_series.loc[features_df.index]], axis=1)
+    else:
+        processed_df = features_df
+
+    return processed_df
+
+
+@csrf_exempt
+def split_arff_dataset(request):
+    """Divide un dataset ARFF en conjuntos train/val/test con transformaciones opcionales."""
+    if request.method != "POST":
+        return JsonResponse({"error": "Método no permitido. Use POST"}, status=405)
+
+    upload = request.FILES.get("file")
+    if upload is None:
+        return JsonResponse({"error": "Debe adjuntar un archivo ARFF en el campo 'file'"}, status=400)
+
+    options_raw = request.POST.get("options", "{}")
+    try:
+        options = json.loads(options_raw) if isinstance(options_raw, str) else options_raw
+        if options is None:
+            options = {}
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "El campo 'options' debe ser un JSON válido"}, status=400)
+
+    try:
+        file_content = upload.read().decode("utf-8", errors="ignore")
+        dataset = arff.load(StringIO(file_content))
+    except Exception as exc:
+        return JsonResponse({"error": f"No se pudo procesar el archivo ARFF: {exc}"}, status=400)
+
+    attributes = dataset.get("attributes")
+    data_rows = dataset.get("data", [])
+    if not attributes or not isinstance(attributes, list):
+        return JsonResponse({"error": "El archivo ARFF no contiene la sección de atributos válida"}, status=400)
+
+    attribute_names = [attr[0] for attr in attributes]
+    df = pd.DataFrame(data_rows, columns=attribute_names)
+
+    processed_df = _preprocess_dataframe(df, options)
+    if processed_df.empty:
+        return JsonResponse({"error": "El DataFrame resultante está vacío tras el preprocesamiento"}, status=400)
+
+    train_size = float(options.get("train_size", 0.6))
+    val_size = float(options.get("val_size", 0.2))
+    test_size = float(options.get("test_size", 0.2))
+
+    try:
+        _validate_split_sizes(train_size, val_size, test_size)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
+    random_state = int(options.get("random_state", 42))
+
+    stratify_opt = options.get("stratify", True)
+    target_column = options.get("target_column", "class")
+    stratify_col = None
+    if isinstance(stratify_opt, bool) and stratify_opt:
+        if target_column in processed_df.columns:
+            stratify_col = target_column
+    elif isinstance(stratify_opt, str) and stratify_opt in processed_df.columns:
+        stratify_col = stratify_opt
+
+    try:
+        train_df, val_df, test_df = _split_dataset(
+            processed_df,
+            train_size=train_size,
+            val_size=val_size,
+            test_size=test_size,
+            stratify_col=stratify_col,
+            random_state=random_state,
+        )
+    except ValueError as exc:
+        return JsonResponse({"error": f"Error al dividir el dataset: {exc}"}, status=400)
+
+    relation_name = dataset.get("relation") or Path(upload.name).stem or "dataset"
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{relation_name}_train.arff", _dataframe_to_arff(train_df, f"{relation_name}_train"))
+        zf.writestr(f"{relation_name}_val.arff", _dataframe_to_arff(val_df, f"{relation_name}_val"))
+        zf.writestr(f"{relation_name}_test.arff", _dataframe_to_arff(test_df, f"{relation_name}_test"))
+
+    zip_buffer.seek(0)
+    response = HttpResponse(zip_buffer.getvalue(), content_type="application/zip")
+    response["Content-Disposition"] = f"attachment; filename={relation_name}_splits.zip"
+    return response
 
 
 def _normalize_records(records):
